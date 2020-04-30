@@ -1,3 +1,4 @@
+// @ts-nocheck
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
@@ -18,418 +19,218 @@
 // The readable side outputs objects of the form
 // { tcodes: [time stamps], hcodes: [fingerprints] }
 
-'use strict';
+'use strict'
 
-const log = console.log;
-const dsp = require('dsp.js');
-const { Transform } = require('stream');
+// MODIFIABLE CONSTANTS
+const SAMPLING_RATE = 22050 // DEFAULT: 22050 Hz (must also change WINDOW_DT and PRUNING_DT to match)
+const MNLM = 15 // Default 5 (max num of local maxima per spectrum; lower = fewer fingerprints) // minor influence, lower slightly faster
+const MPPP = 5 // Default 3 (max num of hashes per peak; lower = fewer fingerprints) // minor influence, lower slightly faster
+const NFFT = 2048 // Default 512 (size of FFT window; higher = more spectral precision but less temporal precision) (opts. for EQ vs. noise?)
+const WINDOW_DF = 70 // Default 60 (max difference between fingerprint pitches; lower = fewer fingerprints) (MAX of NFFT/2)
+const PRUNING_DT = 40 // Default 24 ms/10, was 75 for first scan (window to remove peaks for better later ones; higher = fewer fingerprints but more processing)
 
-const SAMPLING_RATE = 22050;
-// sampling rate in Hz. If you change this, you must adapt WINDOW_DT and PRUNING_DT below to match your needs
-// set the Nyquist frequency, SAMPLING_RATE/2, so as to match the max frequencies you want to get landmark fingerprints.
 
-const BPS = 2;
+
+
+
+// time window to generate landmark pairs. time in units of dt (see definition above)
+const WINDOW_DT = 96 // (a little more than 1 sec.)
+
+// frequency window to generate landmark pairs, in units of DF = SAMPLING_RATE / NFFT. Values between 0 and NFFT/2
+const IF_MIN = 0 // you can increase this to avoid having fingerprints for low frequencies
+const IF_MAX = NFFT / 2 // you don't really want to decrease this, better reduce SAMPLING_RATE instead for faster computation.
+
+const BPS = 2
 // bytes per sample, 2 for 16 bit PCM. If you change this, you must change readInt16LE methods in the code.
 
-const MNLM = 5;
-// maximum number of local maxima for each spectrum. useful to tune the amount of fingerprints at output
+const dsp = require('dsp.js')
+const { Transform } = require('stream')
 
-const MPPP = 3;
-// maximum of hashes each peak can lead to. useful to tune the amount of fingerprints at output
 
-const NFFT = 512;  // size of the FFT window. As we use real signals, the spectra will have nfft/2 points.
-// Increasing it will give more spectral precision, less temporal precision.
-// It may be good or bad depending on the sounds you want to match and on whether your input is deformed by EQ or noise.
-
-const STEP = NFFT/2; // 50 % overlap
+const STEP = NFFT / 2 // 50 % overlap
 // if SAMPLING_RATE is 22050 Hz, this leads to a sampling frequency
 // fs = (SAMPLING_RATE / STEP) /s = 86/s, or dt = 1/fs = 11,61 ms.
 // It's not really useful to change the overlap ratio.
-const DT = 1 / (SAMPLING_RATE / STEP);
+const DT = 1 / (SAMPLING_RATE / STEP)
 
-const FFT = new dsp.FFT(NFFT, SAMPLING_RATE);
-
-const HWIN = new Array(NFFT); // prepare the hann window
-for (var i=0; i<NFFT; i++) {
-	HWIN[i] = 0.5 * (1 - Math.cos(2*Math.PI*i/(NFFT-1)));
+const HWIN = new Array(NFFT) // prepare the hann window
+for (let i = 0; i < NFFT; i++) {
+  HWIN[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / (NFFT - 1)))
 }
 
-const MASK_DECAY_LOG = Math.log(0.995); // threshold decay factor between frames.
-
-// frequency window to generate landmark pairs, in units of DF = SAMPLING_RATE / NFFT. Values between 0 and NFFT/2
-const IF_MIN = 0; // you can increase this to avoid having fingerprints for low frequencies
-const IF_MAX = NFFT/2; // you don't really want to decrease this, better reduce SAMPLING_RATE instead for faster computation.
-
-const WINDOW_DF = 60; // we set this to avoid getting fingerprints linking very different frequencies.
-// useful to reduce the amount of fingerprints. this can be maxed at NFFT/2 if you wish.
-
-// time window to generate landmark pairs. time in units of dt (see definition above)
-const WINDOW_DT = 96; // a little more than 1 sec.
-const PRUNING_DT = 24; // about 250 ms, window to remove previous peaks that are superseded by later ones.
-// tune the PRUNING_DT value to match the effects of MASK_DECAY_LOG.
-// also, PRUNING_DT controls the latency of the pipeline. higher PRUNING_DT = higher latency
+const MASK_DECAY_LOG = Math.log(0.995) // threshold decay factor between frames.
 
 // prepare the values of exponential masks.
-const MASK_DF = 3; // mask decay scale in DF units on the frequency axis.
-const EWW = new Array(NFFT/2);
-for (let i=0; i<NFFT/2; i++) {
-	EWW[i] = new Array(NFFT/2);
-	for (let j=0; j<NFFT/2; j++) {
-		EWW[i][j] = -0.5*Math.pow((j-i)/MASK_DF/Math.sqrt(i+3),2); // gaussian mask is a polynom when working on the log-spectrum. log(exp()) = Id()
-		// MASK_DF is multiplied by Math.sqrt(i+3) to have wider masks at higher frequencies
-		// see the visualization out-thr.png for better insight of what is happening
-	}
-}
-
-const VERBOSE = false;
-const DO_PLOT = false; // limit the amount of audio processing to ~12s, generate plots and stop the routine.
-
-if (DO_PLOT) {
-	var fs = require('fs');
-	var png = require('node-png').PNG;
+const MASK_DF = 3 // mask decay scale in DF units on the frequency axis.
+const EWW = new Array(NFFT / 2)
+for (let i = 0; i < NFFT / 2; i++) {
+  EWW[i] = new Array(NFFT / 2)
+  for (let j = 0; j < NFFT / 2; j++) {
+    EWW[i][j] = -0.5 * Math.pow((j - i) / MASK_DF / Math.sqrt(i + 3), 2) // gaussian mask is a polynom when working on the log-spectrum. log(exp()) = Id()
+    // MASK_DF is multiplied by Math.sqrt(i+3) to have wider masks at higher frequencies
+    // see the visualization out-thr.png for better insight of what is happening
+  }
 }
 
 class Codegen extends Transform {
 
-	constructor(options) {
-		if (!options) options = {};
-		options.readableObjectMode = true;
-		options.highWaterMark = 10;
-		super(options);
-		this.buffer = new Buffer(0);
-		this.bufferDelta = 0;
+  constructor(options) {
+    if (!options) options = {}
+    options.readableObjectMode = true
+    options.highWaterMark = 10
+    super(options)
+    this.buffer = new Buffer(0)
+    this.bufferDelta = 0
 
-		this.stepIndex = 0;
-		this.marks = [];
-		this.threshold = new Array(NFFT/2);
-		for (var i=0; i<NFFT/2; i++) {
-			this.threshold[i] = -3;
-		}
+    this.stepIndex = 0
+    this.marks = []
+    this.threshold = new Array(NFFT / 2)
+    for (let i = 0; i < NFFT / 2; i++) {
+      this.threshold[i] = -3
+    }
 
-		if (DO_PLOT) {
-			this.fftData = [];
-			this.thrData = [];
-			this.peakData = [];
-		}
+    // copy constants to be able to reference them in parent modules
+    this.DT = DT
+    this.SAMPLING_RATE = SAMPLING_RATE
+    this.BPS = BPS
+  }
 
-		// copy constants to be able to reference them in parent modules
-		this.DT = DT;
-		this.SAMPLING_RATE = SAMPLING_RATE;
-		this.BPS = BPS;
-	}
+  _write(chunk, enc, next) {
 
-	_write(chunk, enc, next) {
+    const tcodes = []
+    const hcodes = []
 
-		if (VERBOSE) log("t=" + Math.round(this.stepIndex/STEP) + " received " + chunk.length + " bytes");
+    this.buffer = Buffer.concat([this.buffer, chunk])
 
-		let tcodes = [];
-		let hcodes = [];
+    const FFT = new dsp.FFT(NFFT, SAMPLING_RATE)
 
-		this.buffer = Buffer.concat([this.buffer,chunk]);
+    while ((this.stepIndex + NFFT) * BPS < this.buffer.length + this.bufferDelta) {
+      const data = new Array(NFFT) // window data
 
-		while ((this.stepIndex + NFFT) * BPS < this.buffer.length + this.bufferDelta) {
-			let data = new Array(NFFT); // window data
+      // fill the data, windowed (HWIN) and scaled
+      for (let i = 0, limit = NFFT; i < limit; i++) {
+        data[i] = HWIN[i] * this.buffer.readInt16LE((this.stepIndex + i) * BPS - this.bufferDelta) / Math.pow(2, 8 * BPS - 1)
+      }
+      this.stepIndex += STEP
+      // console.log("params stepIndex=" + this.stepIndex + " bufD=" + this.bufferDelta);
 
+      FFT.forward(data) 	// compute FFT
 
-			// check range. for debugging only
-			//var loLimit = (this.stepIndex + 0) * BPS - this.bufferDelta;
-			//if (loLimit < 0) log("fp: loLimit too low: " + loLimit + " sI=" + this.stepIndex + " bPS=" + BPS + " sB=" + this.skipBytes + " bD=" + this.bufferDelta + " bL=" + buf.length + " pDB=" + this.practicalDecodedBytes);
+      // log-normal surface
+      for (let i = IF_MIN; i < IF_MAX; i++) {
+        // the lower part of the spectrum is damped, the higher part is boosted, leading to a better peaks detection.
+        FFT.spectrum[i] = Math.abs(FFT.spectrum[i]) * Math.sqrt(i + 16)
+      }
 
-			//var hiLimit = (this.stepIndex + NFFT-1) * BPS - this.bufferDelta
-			//if (hiLimit >= this.buffer.length) log("fp: hiLimit too high: " + hiLimit + " vs " + this.buffer.length + " sI=" + this.stepIndex + " nF=" + NFFT + " bPS=" + BPS + " sB=" + this.skipBytes + " bD=" + this.bufferDelta + " bL=" + buf.length + " pDB=" + this.practicalDecodedBytes);
+      // positive values of the difference between log spectrum and threshold
+      const diff = new Array(NFFT / 2)
+      for (let i = IF_MIN; i < IF_MAX; i++) {
+        diff[i] = Math.max(Math.log(Math.max(1e-6, FFT.spectrum[i])) - this.threshold[i], 0)
+      }
 
-			// fill the data, windowed (HWIN) and scaled
-			for (let i=0,limit = NFFT; i<limit; i++) {
-				data[i] = HWIN[i] * this.buffer.readInt16LE((this.stepIndex + i) * BPS - this.bufferDelta) / Math.pow(2, 8*BPS-1);
-			}
-			this.stepIndex += STEP;
-			//console.log("params stepIndex=" + this.stepIndex + " bufD=" + this.bufferDelta);
+      // find at most MNLM local maxima in the spectrum at this timestamp.
+      const iLocMax = new Array(MNLM)
+      const vLocMax = new Array(MNLM)
+      for (let i = 0; i < MNLM; i++) {
+        iLocMax[i] = NaN
+        vLocMax[i] = Number.NEGATIVE_INFINITY
+      }
+      for (let i = IF_MIN + 1; i < IF_MAX - 1; i++) {
+        // console.log("checking local maximum at i=" + i + " data[i]=" + data[i] + " vLoc[last]=" + vLocMax[MNLM-1] );
+        if (diff[i] > diff[i - 1] && diff[i] > diff[i + 1] && FFT.spectrum[i] > vLocMax[MNLM - 1]) { // if local maximum big enough
+          // insert the newly found local maximum in the ordered list of maxima
+          for (let j = MNLM - 1; j >= 0; j--) {
+            // navigate the table of previously saved maxima
+            if (j >= 1 && FFT.spectrum[i] > vLocMax[j - 1]) continue
+            for (let k = MNLM - 1; k >= j + 1; k--) {
+              iLocMax[k] = iLocMax[k - 1]	// offset the bottom values
+              vLocMax[k] = vLocMax[k - 1]
+            }
+            iLocMax[j] = i
+            vLocMax[j] = FFT.spectrum[i]
+            break
+          }
+        }
+      }
 
-			FFT.forward(data); 	// compute FFT
+      // now that we have the MNLM highest local maxima of the spectrum,
+      // update the local maximum threshold so that only major peaks are taken into account.
+      for (let i = 0; i < MNLM; i++) {
+        if (vLocMax[i] > Number.NEGATIVE_INFINITY) {
+          for (let j = IF_MIN; j < IF_MAX; j++) {
+            this.threshold[j] = Math.max(this.threshold[j], Math.log(FFT.spectrum[iLocMax[i]]) + EWW[iLocMax[i]][j])
+          }
+        } else {
+          vLocMax.splice(i, MNLM - i) // remove the last elements.
+          iLocMax.splice(i, MNLM - i)
+          break
+        }
+      }
 
-			// log-normal surface
-			for (let i=IF_MIN; i<IF_MAX; i++) {
-				// the lower part of the spectrum is damped, the higher part is boosted, leading to a better peaks detection.
-				FFT.spectrum[i] = Math.abs(FFT.spectrum[i])*Math.sqrt(i+16);
-			}
+      // array that stores local maxima for each time step
+      this.marks.push({ "t": Math.round(this.stepIndex / STEP), "i": iLocMax, "v": vLocMax })
 
-			if (DO_PLOT) this.fftData.push(FFT.spectrum.slice());
+      // remove previous (in time) maxima that would be too close and/or too low.
+      const nm = this.marks.length
+      const t0 = nm - PRUNING_DT - 1
+      for (let i = nm - 1; i >= Math.max(t0 + 1, 0); i--) {
+        // console.log("pruning ntests=" + this.marks[i].v.length);
+        for (let j = 0; j < this.marks[i].v.length; j++) {
+          // console.log("pruning " + this.marks[i].v[j] + " <? " + this.threshold[this.marks[i].i[j]] + " * " + Math.pow(this.mask_decay, lenMarks-1-i));
+          if (this.marks[i].i[j] != 0 && Math.log(this.marks[i].v[j]) < this.threshold[this.marks[i].i[j]] + MASK_DECAY_LOG * (nm - 1 - i)) {
 
-			// positive values of the difference between log spectrum and threshold
-			let diff = new Array(NFFT/2);
-			for (let i=IF_MIN; i<IF_MAX; i++) {
-				diff[i] = Math.max(	Math.log(Math.max(1e-6,FFT.spectrum[i])) - this.threshold[i] , 0);
-			}
+            this.marks[i].v[j] = Number.NEGATIVE_INFINITY
+            this.marks[i].i[j] = Number.NEGATIVE_INFINITY
+          }
+        }
+      }
 
-			// find at most MNLM local maxima in the spectrum at this timestamp.
-			let iLocMax = new Array(MNLM);
-			let vLocMax = new Array(MNLM);
-			for (let i=0; i<MNLM; i++) {
-				iLocMax[i] = NaN;
-				vLocMax[i] = Number.NEGATIVE_INFINITY;
-			}
-			for (let i=IF_MIN+1; i<IF_MAX-1; i++) {
-				//console.log("checking local maximum at i=" + i + " data[i]=" + data[i] + " vLoc[last]=" + vLocMax[MNLM-1] );
-				if (diff[i] > diff[i-1] && diff[i] > diff[i+1] && FFT.spectrum[i] > vLocMax[MNLM-1]) { // if local maximum big enough
-					// insert the newly found local maximum in the ordered list of maxima
-					for (let j=MNLM-1; j>=0; j--) {
-						// navigate the table of previously saved maxima
-						if (j >= 1 && FFT.spectrum[i] > vLocMax[j-1]) continue;
-						for (let k=MNLM-1; k>=j+1; k--) {
-							iLocMax[k] = iLocMax[k-1];	// offset the bottom values
-							vLocMax[k] = vLocMax[k-1];
-						}
-						iLocMax[j] = i;
-						vLocMax[j] = FFT.spectrum[i];
-						break;
-					}
-				}
-			}
+      // generate hashes for peaks that can no longer be pruned. stepIndex:{f1:f2:deltaindex}
+      if (t0 >= 0) {
+        const m = this.marks[t0]
 
-			// now that we have the MNLM highest local maxima of the spectrum,
-			// update the local maximum threshold so that only major peaks are taken into account.
-			for (let i=0; i<MNLM; i++) {
-				if (vLocMax[i] > Number.NEGATIVE_INFINITY) {
-					for (let j=IF_MIN; j<IF_MAX; j++) {
-						this.threshold[j] = Math.max(this.threshold[j], Math.log(FFT.spectrum[iLocMax[i]]) + EWW[iLocMax[i]][j]);
-					}
-				} else {
-					vLocMax.splice(i,MNLM-i); // remove the last elements.
-					iLocMax.splice(i,MNLM-i);
-					break;
-				}
-			}
+        loopCurrentPeaks:
+        for (let i = 0; i < m.i.length; i++) {
+          let nFingers = 0
 
-			if (DO_PLOT) {
-				let tmp = new Array(NFFT/2);
-				for (let i=0; i<IF_MIN; i++) {
-					tmp[i] = 0;
-				}
-				for (let i=IF_MIN; i<IF_MAX; i++) {
-					tmp[i] = Math.exp(this.threshold[i]);
-				}
-				for (let i=IF_MAX; i<NFFT/2; i++) {
-					tmp[i] = 0;
-				}
-				this.thrData.push(tmp);
-			}
+          for (let j = t0; j >= Math.max(0, t0 - WINDOW_DT); j--) {
 
-			if (false && VERBOSE && iLocMax.length > 0) {
-				log("t=" + Math.round(this.stepIndex/STEP) + " f=" + iLocMax + " peak=" + vLocMax);
-			}
+            const m2 = this.marks[j]
 
-			// array that stores local maxima for each time step
-			this.marks.push({"t": Math.round(this.stepIndex/STEP), "i":iLocMax, "v":vLocMax});
+            for (let k = 0; k < m2.i.length; k++) {
+              if (m2.i[k] != m.i[i] && Math.abs(m2.i[k] - m.i[i]) < WINDOW_DF) {
+                tcodes.push(m.t) // Math.round(this.stepIndex/STEP));
+                // in the hash: dt=(t0-j) has values between 0 and WINDOW_DT, so for <65 6 bits each
+                //				f1=m2.i[k] , f2=m.i[i] between 0 and NFFT/2-1, so for <255 8 bits each.
+                hcodes.push(m2.i[k] + NFFT / 2 * (m.i[i] + NFFT / 2 * (t0 - j)))
+                nFingers += 1
+                if (nFingers >= MPPP) continue loopCurrentPeaks
+              }
+            }
+          }
+        }
+      }
 
-			// remove previous (in time) maxima that would be too close and/or too low.
-			let nm = this.marks.length;
-			let t0 = nm-PRUNING_DT-1;
-			for (let i=nm-1; i>=Math.max(t0+1,0); i--) {
-				//console.log("pruning ntests=" + this.marks[i].v.length);
-				for (let j=0; j<this.marks[i].v.length; j++) {
-					//console.log("pruning " + this.marks[i].v[j] + " <? " + this.threshold[this.marks[i].i[j]] + " * " + Math.pow(this.mask_decay, lenMarks-1-i));
-					if (this.marks[i].i[j] != 0 && Math.log(this.marks[i].v[j]) < this.threshold[this.marks[i].i[j]] + MASK_DECAY_LOG * (nm-1-i)) {
-						if (false && VERBOSE) log("t=" + Math.round(this.stepIndex/STEP) + " pruning " + i + " t=" + this.marks[i].t + " locmax=" + j);
-						this.marks[i].v[j] = Number.NEGATIVE_INFINITY;
-						this.marks[i].i[j] = Number.NEGATIVE_INFINITY;
-					}
-				}
-			}
+      // decrease the threshold for the next iteration
+      for (let j = 0; j < this.threshold.length; j++) {
+        this.threshold[j] += MASK_DECAY_LOG
+      }
+    }
 
-			// generate hashes for peaks that can no longer be pruned. stepIndex:{f1:f2:deltaindex}
-			let nFingersTotal = 0;
-			if (t0 >= 0) {
-				let m = this.marks[t0];
+    if (this.buffer.length > 1000000) {
+      const delta = this.buffer.length - 20000
+      // console.log("buffer drop " + delta + " bytes");
+      this.bufferDelta += delta
+      this.buffer = this.buffer.slice(delta)
+    }
 
-				loopCurrentPeaks:
-				for (let i=0; i < m.i.length; i++) {
-					let nFingers = 0;
+    if (tcodes.length > 0) {
+      this.push({ tcodes: tcodes, hcodes: hcodes })
+      // this will eventually trigger data events on the read interface
+    }
 
-					loopPastTime:
-					for (let j=t0; j>=Math.max(0,t0-WINDOW_DT); j--) {
-
-						let m2 = this.marks[j];
-
-						loopPastPeaks:
-						for (let k=0; k<m2.i.length; k++) {
-							if (m2.i[k] != m.i[i] && Math.abs(m2.i[k] - m.i[i]) < WINDOW_DF) {
-								tcodes.push(m.t); //Math.round(this.stepIndex/STEP));
-								// in the hash: dt=(t0-j) has values between 0 and WINDOW_DT, so for <65 6 bits each
-								//				f1=m2.i[k] , f2=m.i[i] between 0 and NFFT/2-1, so for <255 8 bits each.
-								hcodes.push(m2.i[k] + NFFT/2 * (m.i[i] + NFFT/2 * (t0-j)));
-								nFingers += 1;
-								nFingersTotal += 1;
-								if (DO_PLOT) this.peakData.push([m.t, j, m.i[i], m2.i[k]]); // t1, t2, f1, f2
-								if (nFingers >= MPPP) continue loopCurrentPeaks;
-							}
-						}
-					}
-				}
-			}
-			if (nFingersTotal > 0 && VERBOSE) {
-				log("t=" + Math.round(this.stepIndex/STEP) + " generated " + nFingersTotal + " fingerprints");
-			}
-			if (!DO_PLOT) {
-				this.marks.splice(0,t0+1-WINDOW_DT);
-			}
-
-			// decrease the threshold for the next iteration
-			for (let j=0; j<this.threshold.length; j++) {
-				this.threshold[j] += MASK_DECAY_LOG;
-			}
-		}
-
-		if (this.buffer.length > 1000000) {
-			const delta = this.buffer.length - 20000;
-			//console.log("buffer drop " + delta + " bytes");
-			this.bufferDelta += delta;
-			this.buffer = this.buffer.slice(delta);
-		}
-
-		if (VERBOSE) {
-			log("fp processed " + (this.practicalDecodedBytes - this.decodedBytesSinceCallback) + " while threshold is " + (0.99*this.thresholdBytes));
-		}
-
-		if (this.stepIndex/STEP > 500 && DO_PLOT) { // approx 12 s of audio data
-			this.plot()
-			DO_PLOT = false;
-			setTimeout(function() {
-				process.exit(0);
-			}, 3000);
-		}
-
-		if (tcodes.length > 0) {
-			this.push({ tcodes: tcodes, hcodes: hcodes });
-			// this will eventually trigger data events on the read interface
-		}
-
-		next();
-	}
-
-	plot() { // plot section
-
-		if (false) { // raw signal plot
-			let buf = new Array(this.buffer.length / BPS);
-			for (let i=0; i<buf.length; i++) {
-				buf[i] = this.buffer.readInt16LE(i);
-			}
-			var img = new png({width:buf.length,height:64});
-			img.data = new Buffer(img.width * img.height * 4);
-			var norm = minmax(buf, 1);
-
-			for (var x = 0; x < img.width; x++) {
-				for (var y = 0; y < img.height; y++) {
-					colormap(0, img.data, (img.width * y + x) << 2, null);
-				}
-				var yPoint = Math.round(((buf[x]-norm[0]) / (norm[1]-norm[0])) * 64);
-				colormap(1, img.data, (img.width * yPoint + x) << 2, null);
-			}
-			img.pack().pipe(fs.createWriteStream('out-raw.png'));
-		}
-
-		// fft plot
-		console.log("fftData len=" + this.fftData.length);
-		var img = new png({width:this.fftData.length,height:this.fftData[0].length});
-		img.data = new Buffer(img.width * img.height * 4);
-		var norm = minmax(this.fftData, 2);
-		if (VERBOSE) {
-			log("fft min=" + norm[0] + " max=" + norm[1]);
-		}
-		for (let x = 0; x < img.width; x++) {
-			for (let y = 0; y < img.height; y++) {
-				colormap(Math.abs((this.fftData[x][y]-norm[0]) / (norm[1]-norm[0])), img.data, ((img.width * (img.height-1-y) + x) << 2),'r');
-			}
-		}
-		for (let i = 0; i < this.peakData.length; i++) {
-			drawLine(img,this.peakData[i][0],this.peakData[i][1],this.peakData[i][2],this.peakData[i][3]);
-		}
-
-		for (let x = 0; x < img.width; x++) {
-			for (let i = 0; i < this.marks[x].i.length; i++) {
-				if (this.marks[x].i[i] > Number.NEGATIVE_INFINITY) {
-					drawMarker(img, x, this.marks[x].i[i], 2);
-				}
-			}
-		}
-		img.pack().pipe(fs.createWriteStream('out-fft.png'));
-
-
-		// threshold plot
-		var img = new png({width:this.thrData.length,height:this.thrData[0].length});
-		img.data = new Buffer(img.width * img.height * 4);
-		var norm = minmax(this.thrData, 2);
-		if (VERBOSE) {
-			log("thr min=" + norm[0] + " max=" + norm[1]);
-		}
-		for (let x = 0; x < img.width; x++) {
-			for (let y = 0; y < img.height; y++) {
-				colormap(Math.abs((this.thrData[x][y]-norm[0]) / (norm[1]-norm[0])), img.data, ((img.width * (img.height-1-y) + x) << 2),'r');
-			}
-
-			for (let i = 0; i < this.marks[x].i.length; i++) {
-				if (this.marks[x].i[i] > Number.NEGATIVE_INFINITY) {
-					drawMarker(img, x, this.marks[x].i[i], 2);
-				}
-			}
-		}
-		img.pack().pipe(fs.createWriteStream('out-thr.png'));
-	}
+    next()
+  }
 }
 
-
-var colormap = function(x, buffer, index, color) {
-	let mask = [1,1,1];
-	if (color == 'r') {
-		mask = [0,1,1];
-	} else if (color == 'b') {
-		mask = [1,1,0];
-	} else if (color == 'grey') {
-		mask = [0.5,0.5,0.5];
-	}
-	const r = 255*Math.sqrt(Math.min(Math.max(x,0),1));
-	buffer[index] = Math.round(255-r*mask[0]);
-	buffer[index+1] = Math.round(255-r*mask[1]);
-	buffer[index+2] = Math.round(255-r*mask[2]);
-	buffer[index+3] = 255; // alpha channel
-}
-
-var minmax = function(a,nDim) {
-	let norm = [0, 0];
-	for (let x = 0; x < a.length; x++) {
-		if (nDim == 1) {
-			norm[0] = Math.min(a[x], norm[0]);
-			norm[1] = Math.max(a[x], norm[1]);
-		} else if (nDim == 2) {
-			for (let y = 0; y < a[0].length; y++) {
-				norm[0] = Math.min(a[x][y], norm[0]);
-				norm[1] = Math.max(a[x][y], norm[1]);
-			}
-		}
-	}
-	return norm;
-}
-
-var drawMarker = function(img, x, y, radius) {
-	//console.log("draw marker x=" + x + " y=" + y);
-	colormap(1, img.data, ((img.width * (img.height-1-y) + x) << 2), 'b');
-	if (radius > 1) {
-		drawMarker(img, x+1, y, radius-1);
-		drawMarker(img, x, y+1, radius-1);
-		drawMarker(img, x-1, y, radius-1);
-		drawMarker(img, x, y-1, radius-1);
-	}
-	return;
-}
-
-var drawLine = function(img, x1, x2, y1, y2) {
-	log("draw line x1=" + x1 + " y1=" + y1 + " x2=" + x2 + " y2=" + y2);
-	const len = Math.round(Math.sqrt(Math.pow(y2-y1,2)+Math.pow(x2-x1,2)));
-	for (let i=0; i<=len; i++) {
-		const x = x1+Math.round((x2-x1)*i/len);
-		const y = y1+Math.round((y2-y1)*i/len);
-		colormap(1, img.data, ((img.width * (img.height-1-y) + x) << 2), 'grey');
-	}
-
-}
-
-module.exports = Codegen;
+module.exports = Codegen
